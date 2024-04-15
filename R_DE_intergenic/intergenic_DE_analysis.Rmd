@@ -1,0 +1,1482 @@
+---
+title: "Comparing differential expression of predicted transcripbed instergenic regions"
+author: "Amanda Yeo, Hernan Lorenzi, Orna Cohen-Fix"
+date: "2023-12-19"
+output: html_document
+---
+
+```{r include=FALSE} 
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                    tidy.opts=list(width.cutoff=80),tidy=TRUE)
+```
+
+### Install required packages
+
+```{r}
+### Install required R libraries/packages:
+
+# CRAN repository:
+required_cran_packages <- c("cowplot","ggpubr","ggsci","RColorBrewer","pheatmap","ashr")
+new_cran_packages <- required_cran_packages[!(required_cran_packages %in%
+                                                installed.packages()[,"Package"])]
+if(length(new_cran_packages)>0) {install.packages(new_cran_packages)}
+
+# Bioconductor repository:
+required_bioconductor_packages <- c("DESeq2","org.Sc.sgd.db","EnhancedVolcano","enrichplot","clusterProfiler","ggvenn")
+
+new_bioconductor_packages <- required_bioconductor_packages[!(required_bioconductor_packages %in%
+                                                installed.packages()[,"Package"])]
+
+if(length(new_bioconductor_packages)>0) {
+  if (!require("BiocManager", quietly = TRUE)){
+    install.packages("BiocManager")
+  }
+  BiocManager::install(new_bioconductor_packages)
+}
+```
+
+### Load R libraries
+
+```{r}
+# Packages for differential expression analysis and plotting:
+
+suppressWarnings(
+  suppressPackageStartupMessages({
+    library(DESeq2);  # Package for differential expression analysis
+    library(cowplot); # Package for saving plots (ggsave2)
+    library(ggpubr); # Package for plotting functions
+    library(ggsci);
+    library(RColorBrewer); 
+    library(pheatmap); # Package for volcane plot functions
+    library(org.Sc.sgd.db); # Yeast annotations
+    library(EnhancedVolcano);
+    library(clusterProfiler);
+    library(enrichplot);
+    library("ggvenn")
+    }
+  )
+)
+
+```
+
+### Load useful functions
+
+```{r}
+#
+# --- function for adding gene names to DESeq2 result table ---
+#
+get_gene_names_from_gene_ids <- function(ensemble_ids, annotation_db, 
+                                         look_for = 'ENSEMBL', 
+                                         fetch = 'GENENAME', return_all = TRUE){
+  # Reference organism: Saccharomyces cerevisiae => DATABASE = org.Sc.sgd.db
+  symbols <- mapIds(annotation_db, keys = ensemble_ids, column = fetch, 
+                    keytype = look_for, multiVals = "first")
+  symbols <- symbols[!is.na(symbols)]
+  to_name <- ensemble_ids %in% names(symbols)
+  ensemble_ids[to_name] <- as.vector(symbols)
+  
+  if (return_all){
+    return(unlist(lapply(ensemble_ids, function(x){if(is.null(x)){x="NA"}else{x=x}})))
+  }
+  else {
+    return(ensemble_ids[to_name])
+  }
+}
+
+#
+# --- function for PCA plots ---
+#
+plot_PCA = function(object, color_by="condition", 
+                    shape_by = 19, ntop=500, size = 3,
+                    returnData=FALSE, pcs = c(1,2))
+{
+  # Check variables are present in object
+  intgroup = c(color_by)
+  if (shape_by != 19){intgroup <- c(intgroup, shape_by)}
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+
+  # calculate the variance for each gene
+  rv <- rowVars(assay(object))
+
+  # select the ntop genes by variance
+  select <- order(rv, decreasing=TRUE)[seq_len(min(ntop, length(rv)))]
+
+  # perform a PCA on the data in assay(x) for the selected genes
+  pca <- prcomp(t(assay(object)[select,]))
+
+  # the contribution to the total variance for each component
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )
+
+  
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pcs[1]], PC2=pca$x[,pcs[2]], group=group, intgroup.df, name=colnames(object))
+  colnames(d)[1] <- paste0("PC",pcs[1])
+  colnames(d)[2] <- paste0("PC",pcs[2])
+  
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  
+  ggplot(data=d, aes_string(x=colnames(d)[1], y=colnames(d)[2], color=color_by, shape=shape_by)) + 
+    geom_point(size=size) + 
+    scale_color_lancet() +
+    xlab(paste0("PC",pcs[1],": ",round(percentVar[pcs[1]] * 100),"% variance")) + # fixed
+    ylab(paste0("PC",pcs[2],": ",round(percentVar[pcs[2]] * 100),"% variance")) + # fixed
+    coord_fixed(ratio = (max(d[,1])-min(d[,1]))/(max(d[,2])-min(d[,2])))
+}
+
+#
+# --- function to plot gene expression of top10 genes ---
+#
+# Plot top10 diff expressed genes
+plot_expression_topN_genes <- function(deseq_result, N=10){
+  my_top10 <- head(rownames(deseq_result),N)
+  for (gene in my_top10){
+    print(gene)
+    #plotCounts(dds, gene, 
+    #           intgroup = c("treatment","genotype"), 
+    #           returnData = FALSE, col=metadata$genotype)
+  }
+}
+
+draw_enrichment_network<- function(dds_res, my_enricher_obj, 
+                                    my_pathway_counts = 400, 
+                                    file_name_prefix = "enricher_dotplot", 
+                                    my_width = 11, 
+                                    my_height = 8,
+                                    padj_cutoff = 0.05){
+  
+  # Save Log2FC vals in log2fc_symb.df
+  log2fc_symb.df <- dplyr::select(as.data.frame(dds_res),
+                           c("log2FoldChange","padj"))
+  
+  log2fc_symb.df$symbols <- get_gene_names_from_gene_ids(
+                            ensemble_ids = rownames(log2fc_symb.df),
+                            annotation_db = org.Sc.sgd.db,                                               look_for = "ENSEMBL",                                                        fetch = "GENENAME",                                                          return_all = TRUE)
+  
+  # Filter results by p.adjust values
+  my_enricher_obj@pvalueCutoff <- padj_cutoff
+  my_enricher_obj@qvalueCutoff <- padj_cutoff
+  
+  distance_matrix <- pairwise_termsim(my_enricher_obj, 
+                                      showCategory = my_pathway_counts)
+            
+  # Get median Log2FC per identified pathway
+  my_median_log2fc <- c()
+  
+  for (g in distance_matrix@result$geneID){
+    g.vec <- strsplit(g, "/")[[1]]
+    log2fc.median <- median(subset(log2fc_symb.df, rownames(log2fc_symb.df) %in% g.vec)[,"log2FoldChange"])
+    my_median_log2fc <- c(my_median_log2fc,log2fc.median)
+  }
+  
+  # Add median Log2FC column
+  if(length(my_median_log2fc) == 0){my_median_log2fc <- 0}
+  distance_matrix@result$median.log2fc <- my_median_log2fc
+      
+  # Network plot
+  p6 <- emapplot(distance_matrix, 
+                 repel = T, 
+                 showCategory = my_pathway_counts, 
+                 legend_n = 5, 
+                 min_edge = 0.4 , 
+                 color = "median.log2fc", 
+                 cex_label_category = 0.4,
+                 node_label = "category", 
+                 label_format = 20)
+  
+  
+  
+  print(p6)
+  
+  ggsave2(filename = paste0(file_name_prefix,"_network_OA.pdf"), 
+          plot = p6, width = my_width, height = my_height)
+  
+  return(p6)
+}
+
+draw_enrichment_tree<- function(dds_res, my_enricher_obj, 
+                                  my_pathway_counts = 400, 
+                                  file_name_prefix = "enricher_dotplot", 
+                                  my_width = 11, 
+                                  my_height = 8, 
+                                  padj_cutoff = 0.05){
+  
+  # Save Log2FC vals in log2fc_symb.df
+  log2fc_symb.df <- dplyr::select(as.data.frame(dds_res), c("log2FoldChange","padj"))
+  
+  log2fc_symb.df$symbols <- get_gene_names_from_gene_ids(
+                              ensemble_ids = rownames(log2fc_symb.df),
+                              annotation_db = org.Sc.sgd.db, 
+                              look_for = "ENSEMBL", 
+                              fetch = "GENENAME", 
+                              return_all = TRUE)
+  
+  # Filter results by p.adjust values
+  my_enricher_obj@pvalueCutoff <- padj_cutoff
+  my_enricher_obj@qvalueCutoff <- padj_cutoff
+  
+  distance_matrix <- pairwise_termsim(my_enricher_obj, showCategory = my_pathway_counts)
+            
+  # Get median Log2FC per identified pathway
+  my_median_log2fc <- c()
+  
+  for (g in distance_matrix@result$geneID){
+    g.vec <- strsplit(g, "/")[[1]]
+    log2fc.median <- median(subset(log2fc_symb.df, rownames(log2fc_symb.df) %in% g.vec)[,"log2FoldChange"])
+    my_median_log2fc <- c(my_median_log2fc,log2fc.median)
+  }
+  
+  # Add median Log2FC column
+  if(length(my_median_log2fc) == 0){my_median_log2fc <- 0}
+  distance_matrix@result$median.log2fc <- my_median_log2fc
+      
+  # Treeplots
+  number_of_categories = min(80, as.vector(table(distance_matrix@result$p.adjust < 0.05)[['TRUE']]))
+  p7 <- treeplot(distance_matrix, 
+                showCategory = 80, 
+                nCluster = round(2 * sqrt(number_of_categories), 
+                                 digits = 0), 
+                color = "median.log2fc", 
+                nWords = 0)
+  
+  
+  
+  print(p7)
+  
+  ggsave2(filename = paste0(file_name_prefix,"_tree_OA.pdf"), 
+          plot = p7, width = my_width, height = my_height)
+  
+  return(p7)
+}
+
+add_flanking_genes <- function(summary_table){
+  if ('Row.names' %in% colnames(summary_table)){
+    tmp_table <- merge(x = summary_table, y = id2genes, by.x = 'Row.names', by.y = 'gene_id', all.x = TRUE)
+  } else {
+    tmp_table <- merge(x = summary_table, y = id2genes, by.x = 'row.names', by.y = 'gene_id', all.x = TRUE)
+  }
+  row.names(tmp_table) <- tmp_table$Row.names
+  tmp_table$up_gene_name <- get_gene_names_from_gene_ids(ensemble_ids = tmp_table$gene_id_up, annotation_db = org.Sc.sgd.db, look_for = 'ENSEMBL', fetch = "GENENAME", return_all = TRUE)
+  tmp_table$down_gene_name <- unlist(get_gene_names_from_gene_ids(ensemble_ids = tmp_table$gene_id_down, annotation_db = org.Sc.sgd.db, look_for = 'ENSEMBL', fetch = "GENENAME", return_all = TRUE))
+  
+  return(tmp_table)
+}
+
+# Function to normalize by TPMs based on transcript length
+# Normalize counts to TPMs
+# Fetch exon length from STAR read counts file 
+normalize_by_TPM <- function(counts.df, gene_length) {
+  
+  # Calculate transcript length in Kb
+  transcript_lengths <- gene_length / 1000
+  transcript_lengths <- subset(transcript_lengths, rownames(transcript_lengths) %in% rownames(counts.df))
+  
+  # Eliminate gene IDs from counts.df without transcript length info in transcript_lengths
+  #transcript_lengths <- transcript_lengths[transcript_lengths$Category %in% rownames(counts.df),]
+  #counts.df <- counts.df[transcript_lengths$Category,]
+  
+  # Sort transcripts_length df by rownames of counts.df
+  transcript_lengths <- transcript_lengths[rownames(counts.df),, drop=F]
+
+  # See reference for formula
+  # https://bioinformatics.ccr.cancer.gov/btep/questions/what-is-the-difference-between-rpkm-fpkm-and-tpm
+  x.df <- apply(counts.df, 
+                MARGIN = 2, 
+                FUN = function(x){ 
+                                  reads_per_kb <- x/transcript_lengths$Length
+                                  pmsf <- sum(reads_per_kb) / 1e6
+                                  reads_per_kb/pmsf
+                                  }
+                )
+  
+  return(x.df)
+}
+```
+
+### Load data
+
+Hernan's code below: Basically the same as Amanda's but loads read counts and metadata for all samples and then split the tables into genotype-specific input files.
+
+```{r}
+# Import read counts table into read_counts variable
+read_counts.star <- read.table(file = "./data/read_counts_aymerge.txt",  
+                          header = TRUE, # First line contains column headers 
+                          row.names = 1, # Column 1 contains row names
+                          sep = "\t")   # Column delimiter is a tab (\t)
+
+# Remove star info columns [1..5]
+read_counts.all <- read_counts.star[,-c(1:5)]
+
+colnames(read_counts.all) <- names(read_counts.all) %>%
+                              stringr::str_remove_all(pattern="..BAM.|_S[0-9]+_L[0-9]+.sorted.dedup.bam")
+
+# Round read counts to the closest integer
+read_counts.all <- round(read_counts.all, digits = 0)
+
+# Read metadata.all table
+metadata.all <- read.table(file = "./data/metadata_OC8901vsOC8345.txt", 
+                       header = TRUE, 
+                       row.names = 1,
+                       sep = "\t")
+
+# Sort read_counts.all table so metadata.all and read_counts.all match order
+read_counts.all <- dplyr::select(read_counts.all, rownames(metadata.all))
+
+# Include sample ids in metadata.all as a variable (column)
+metadata.all$sample_id <- rownames(metadata.all)
+
+# Include total read counts in metadata.all
+metadata.all$read_counts <- colSums(read_counts.all, na.rm = TRUE)
+
+# Make group, strain, treatment and genotype columns as factors
+metadata.all$treatment <- as.factor(metadata.all$treatment)
+metadata.all$strain <- as.factor(metadata.all$strain)
+metadata.all$genotype <- as.factor(metadata.all$genotype)
+metadata.all$experiment <- as.factor(metadata.all$experiment)
+
+## Load flanking gene data
+id2genes <- read.table(file = "./data/aymerge.no_LTR.NO_ref_genes.flanking.txt", header = T, sep = "\t")
+# remove duplicated rows
+id2genes <- id2genes[!duplicated(id2genes$gene_id),]
+
+```
+
+### Keep WT simples
+
+```{r}
+# Keep only WT-specific data to match Amanda's code inputs
+keep <- metadata.all$genotype=="wt"
+metadata <- metadata.all[keep,]
+read_counts <- read_counts.all[,keep]
+```
+
+### DE analysis with DESeq2
+
+```{r}
+# Create folder for storing plots
+mapper <- "no_multimapper"
+plot_path <-  paste0("./",mapper,"/Plots_intergenic_wt")
+DE_path <- paste0("./",mapper,"/DE_intergenic_wt")
+dir.create(path = plot_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = DE_path, showWarnings = FALSE, recursive = TRUE)
+
+# Add extra metadata column with treatment and genotype data combined
+metadata$treat_geno <-  paste(metadata$treatment, metadata$genotype, sep = '_')
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = read_counts,
+                              colData = metadata,
+                              design = ~ experiment + treat_geno) # Here we assume that all genotypes respond the same to treatment
+
+
+# Make sure reference groups are "none" and "wt". This means those categories will be the denominator when calculating Log2FC.
+dds$treatment <- relevel(dds$treatment, "none")
+#dds$genotype <- relevel(dds$genotype, "wt")
+dds$treat_geno <- relevel(dds$treat_geno, "none_wt") 
+dds <- DESeq(dds)
+
+plotDispEsts(dds)
+```
+
+### Explortory analysis #1
+
+```{r}
+# Plot total reads per sample using barchar
+readcounts.p <- ggbarplot(data = metadata,
+                x = "sample_id",
+                y = "read_counts",
+                x.text.angle = 90,
+                fill = "treatment",
+                title = "Total read counts per sample",
+                ylab = "Read counts",
+                sort.by.groups = TRUE,
+                palette = c("red","orange"), #"jco",
+                sort.val = "asc") + xlab("Sample") + ylab("Read counts")
+ggsave2("barplot_read_counts_per_sample_intergenic.pdf", plot = readcounts.p, path = plot_path)
+
+print(readcounts.p)
+```
+
+**Figure 1:** Number of reads per sample
+
+### Preprocess data stored in DESeq2 object dds
+
+```{r}
+# 1. Normalize counts
+#dds.vst <- vst(dds, blind=TRUE)
+# error in vst(dds, blind = TRUE, nsub = 683) : 
+#   less than 'nsub' rows with mean normalized count > 5, 
+#   it is recommended to use varianceStabilizingTransformation directly
+dds.vst <- varianceStabilizingTransformation(dds, blind = TRUE, fitType = "parametric")
+
+#dds.vst <- varianceStabilizingTransformation(dds) # vst(dds, blind=TRUE) gives an error due to too few rows (<1000 in dds object)
+
+# 2. Keep genes with at least 10 reads total across all samples
+keep <- rowSums(as.data.frame(dds.vst@assays@data@listData)) >= 10
+dds.vst <- dds.vst[keep,]
+
+# 3. Calculate distances between samples
+sampleDists <- dist(t(assay(dds.vst)))
+
+# 4. Plot inter-sample distances
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rownames(sampleDistMatrix), dds.vst$treatment)
+
+#colnames(sampleDistMatrix) <- NULL
+hm.p <- pheatmap(mat = sampleDistMatrix,
+                clustering_distance_rows=sampleDists,
+                clustering_distance_cols=sampleDists,
+                labels_row = paste(metadata$treatment, 
+                                   metadata$genotype, sep = "-"),
+                labels_col = metadata$sample_id
+                )
+
+ggsave2(filename = "heat_map_intergenc.pdf", plot = hm.p, path = plot_path)
+
+print(hm.p)
+```
+
+**Figure 2:** wt samples cluster by treatment.
+
+### PCA
+
+```{r}
+# PCA
+principal_components <- c(1,2)
+pca.p <- plot_PCA(object = dds.vst, 
+                    ntop = 500,
+                    color_by = "treat_geno", 
+                    shape_by = "experiment",
+                    pcs = principal_components,
+                    returnData = FALSE)
+
+ggsave(paste("pca_by_group_PC",principal_components[1],principal_components[2],"_intergenic.pdf"), plot = pca.p, path = plot_path)
+print(pca.p)
+```
+
+**Figure 3:** Samples group mainly by alpha factor treatment (PC1), but is seems there is a batch effect based on experiment number (PC2).
+
+```{r}
+
+ggplot(read_counts, aes(x = read_counts[,3])) +
+  geom_histogram(binwidth = 2, fill = "Royalblue", boundary = 0) + xlim(0,1000)
+
+```
+
+**Figure 4:** Read counts per intergenic region follows a negative binomial distribution.
+
+### Print DESeq2 coefficients
+
+```{r}
+print(resultsNames(dds))
+```
+
+### Differential expression analysis -wt:
+
+**1- The effect of treatment across all wt samples (the main effect)**
+
+*Note: For additional information about different ways of extracting results from a DESeq object see results() function help by typing ?results in the console,*
+
+```{r, warning=FALSE}
+# Create results directory where to store result tables
+DE_results_list <- list()
+coef <- c("treat_geno_alpha_factor_wt_vs_none_wt")
+
+# Set coef_id with the DESeq2 coefficient of interest
+coef_id <- "af_vs_none_wt"
+
+# Get DESeq2 results. Note that when using coefficient names, you have to convert the coef vector to a list by doing list(c(coef))
+DE_results <- results(dds, contrast=list(c(coef)))
+
+
+plotMA(DE_results, ylim = c( -3, 3))
+
+```
+
+**Figure 5:** MA plot before shrinkage
+
+```{r}
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=20)
+
+plotMA(DE_results, ylim = c( -3, 3))
+
+summary(DE_results, alpha = 0.05)
+
+# Add gene names to genes flanking intergenic regions 
+DE_results <- add_flanking_genes(summary_table = as.data.frame(DE_results))
+
+DE_results_list[[coef_id]] <- DE_results
+
+```
+
+**Figure 6:** MA plot after shrinkage
+
+```{r}
+ggplot(as(DE_results, "data.frame"), aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0)
+```
+
+**Figure 7:** distribution of pvalues from DE results
+
+### Save tables with results stored in the DE_results_list object
+
+```{r}
+for (example_name in names(DE_results_list)){
+  # Save results table into a file
+  write.table(x = as.data.frame(DE_results_list[[coef_id]]), 
+            file = paste0(DE_path,"/DE_",coef_id,".txt"),
+            sep = "\t", 
+            col.names = NA)
+}
+```
+
+########################################################################### 
+
+# kar4
+
+########################################################################### 
+
+### Keep kar4 simples
+
+```{r}
+# Keep only WT-specific data to match Amanda's code inputs
+keep <- metadata.all$genotype=="kar4"
+metadata <- metadata.all[keep,]
+read_counts <- read_counts.all[,keep]
+```
+
+### DE analysis with DESeq2
+
+```{r}
+# Create folder for storing plots
+plot_path <-  paste0("./",mapper,"/Plots_intergenic_kar4")
+DE_path <- paste0("./",mapper,"/DE_intergenic_kar4")
+dir.create(path = plot_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = DE_path, showWarnings = FALSE, recursive = TRUE)
+
+# Add extra metadata column with treatment and genotype data combined
+metadata$treat_geno <-  paste(metadata$treatment, metadata$genotype, sep = '_')
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = read_counts,
+                              colData = metadata,
+                              design = ~ experiment + treat_geno) # Here we assume that all genotypes respond the same to treatment
+
+
+# Make sure reference groups are "none" and "wt". This means those categories will be the denominator when calculating Log2FC.
+dds$treatment <- relevel(dds$treatment, "none")
+#dds$genotype <- relevel(dds$genotype, "wt")
+dds$treat_geno <- relevel(dds$treat_geno, "none_kar4") 
+dds <- DESeq(dds)
+```
+
+### Explortory analysis #1
+
+```{r}
+# Plot total reads per sample using barchar
+readcounts.p <- ggbarplot(data = metadata,
+                x = "sample_id",
+                y = "read_counts",
+                x.text.angle = 90,
+                fill = "treatment",
+                title = "Total read counts per sample",
+                ylab = "Read counts",
+                sort.by.groups = TRUE,
+                palette = c("red","orange"), #"jco",
+                sort.val = "asc") + xlab("Sample") + ylab("Read counts")
+ggsave2("barplot_read_counts_per_sample_intergenic.pdf", plot = readcounts.p, path = plot_path)
+
+print(readcounts.p)
+```
+
+**Figure 1:** Number of reads per sample
+
+### Preprocess data stored in DESeq2 object dds
+
+```{r}
+# 1. Normalize counts
+#dds.vst <- vst(dds, blind=TRUE)
+dds.vst <- varianceStabilizingTransformation(dds) # vst(dds, blind=TRUE) gives an error due to too few rows (<1000 in dds object)
+
+# 2. Keep genes with at least 10 reads total across all samples
+keep <- rowSums(as.data.frame(dds.vst@assays@data@listData)) >= 10
+dds.vst <- dds.vst[keep,]
+
+# 3. Calculate distances between samples
+sampleDists <- dist(t(assay(dds.vst)))
+
+# 4. Plot inter-sample distances
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rownames(sampleDistMatrix), dds.vst$treatment)
+
+#colnames(sampleDistMatrix) <- NULL
+hm.p <- pheatmap(mat = sampleDistMatrix,
+                clustering_distance_rows=sampleDists,
+                clustering_distance_cols=sampleDists,
+                labels_row = paste(metadata$treatment, 
+                                   metadata$genotype, sep = "-"),
+                labels_col = metadata$sample_id
+                )
+
+ggsave2(filename = "heat_map_intergenc.pdf", plot = hm.p, path = plot_path)
+
+print(hm.p)
+```
+
+**Figure 2:** wt samples cluster by treatment.
+
+### PCA
+
+```{r}
+# PCA
+principal_components <- c(1,2)
+pca.p <- plot_PCA(object = dds.vst, 
+                    ntop = 500,
+                    color_by = "treat_geno", 
+                    shape_by = "experiment",
+                    pcs = principal_components,
+                    returnData = FALSE)
+
+ggsave(paste("pca_by_group_PC",principal_components[1],principal_components[2],"_intergenic.pdf"), plot = pca.p, path = plot_path)
+print(pca.p)
+```
+
+**Figure 3:** Samples group mainly by alpha factor treatment (PC1), but is seems there is a batch effect based on experiment number (PC2).
+
+```{r}
+
+ggplot(read_counts, aes(x = read_counts[,3])) +
+  geom_histogram(binwidth = 1, fill = "Royalblue", boundary = 0) + xlim(0,1000)
+
+```
+
+**Figure 4:** Read counts per intergenic region follows a negative binomial distribution.
+
+### Print DESeq2 coefficients
+
+```{r}
+print(resultsNames(dds))
+```
+
+### Differential expression analysis -wt:
+
+**1- The effect of treatment across all wt samples (the main effect)**
+
+*Note: For additional information about different ways of extracting results from a DESeq object see results() function help by typing ?results in the console,*
+
+```{r, warning=FALSE}
+# Create results directory where to store result tables
+coef <- c("treat_geno_alpha_factor_kar4_vs_none_kar4")
+
+# Set coef_id with the DESeq2 coefficient of interest
+coef_id <- "af_vs_none_kar4"
+
+# Get DESeq2 results. Note that when using coefficient names, you have to convert the coef vector to a list by doing list(c(coef))
+DE_results <- results(dds, contrast=list(c(coef)))
+
+
+plotMA(DE_results, ylim = c( -3, 3))
+
+```
+
+**Figure 5:** MA plot before shrinkage
+
+```{r}
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+plotMA(DE_results, ylim = c( -3, 3))
+
+# Add gene names to results table
+#DE_results$gene_names <- get_gene_names_from_gene_ids(ensemble_ids = rownames(DE_results), annotation_db = org.Sc.sgd.db, look_for = "ENSEMBL", fetch = "GENENAME")
+# Add gene names to genes flanking intergenic regions 
+DE_results <- add_flanking_genes(summary_table = as.data.frame(DE_results))
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=20)
+
+```
+
+**Figure 6:** MA plot after shrinkage
+
+```{r}
+ggplot(as(DE_results, "data.frame"), aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0)
+```
+
+**Figure 7:** distribution of pvalues from DE results
+
+### Save tables with results stored in the DE_results_list object
+
+```{r}
+for (example_name in names(DE_results_list)){
+  # Save results table into a file
+  write.table(x = as.data.frame(DE_results_list[[example_name]]), 
+            file = paste0(DE_path,"/DE_",example_name,".txt"),
+            sep = "\t", 
+            col.names = NA)
+}
+```
+
+########################################################################### 
+
+# Ste12
+
+########################################################################### 
+
+### Keep ste12 samples
+
+```{r}
+# Keep only WT-specific data to match Amanda's code inputs
+keep <- metadata.all$genotype=="ste12"
+metadata <- metadata.all[keep,]
+read_counts <- read_counts.all[,keep]
+```
+
+### DE analysis with DESeq2
+
+```{r}
+# Create folder for storing plots
+plot_path <-  paste0("./",mapper,"/Plots_intergenic_ste12")
+DE_path <- paste0("./",mapper,"/DE_intergenic_ste12")
+dir.create(path = plot_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(path = DE_path, showWarnings = FALSE, recursive = TRUE)
+
+# Add extra metadata column with treatment and genotype data combined
+metadata$treat_geno <-  paste(metadata$treatment, metadata$genotype, sep = '_')
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = read_counts,
+                              colData = metadata,
+                              design = ~ experiment + treat_geno) # Here we assume that all genotypes respond the same to treatment
+
+
+# Make sure reference groups are "none" and "wt". This means those categories will be the denominator when calculating Log2FC.
+dds$treatment <- relevel(dds$treatment, "none")
+#dds$genotype <- relevel(dds$genotype, "wt")
+dds$treat_geno <- relevel(dds$treat_geno, "none_ste12") 
+dds <- DESeq(dds)
+```
+
+### Explortory analysis #1
+
+```{r}
+# Plot total reads per sample using barchar
+readcounts.p <- ggbarplot(data = metadata,
+                x = "sample_id",
+                y = "read_counts",
+                x.text.angle = 90,
+                fill = "treatment",
+                title = "Total read counts per sample",
+                ylab = "Read counts",
+                sort.by.groups = TRUE,
+                palette = c("red","orange"), #"jco",
+                sort.val = "asc") + xlab("Sample") + ylab("Read counts")
+ggsave2("barplot_read_counts_per_sample_intergenic.pdf", plot = readcounts.p, path = plot_path)
+
+print(readcounts.p)
+```
+
+**Figure 1:** Number of reads per sample
+
+### Preprocess data stored in DESeq2 object dds
+
+```{r}
+# 1. Normalize counts
+#dds.vst <- vst(dds, blind=TRUE)
+dds.vst <- varianceStabilizingTransformation(dds) # vst(dds, blind=TRUE) gives an error due to too few rows (<1000 in dds object)
+
+# 2. Keep genes with at least 10 reads total across all samples
+keep <- rowSums(as.data.frame(dds.vst@assays@data@listData)) >= 10
+dds.vst <- dds.vst[keep,]
+
+# 3. Calculate distances between samples
+sampleDists <- dist(t(assay(dds.vst)))
+
+# 4. Plot inter-sample distances
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rownames(sampleDistMatrix), dds.vst$treatment)
+
+#colnames(sampleDistMatrix) <- NULL
+hm.p <- pheatmap(mat = sampleDistMatrix,
+                clustering_distance_rows=sampleDists,
+                clustering_distance_cols=sampleDists,
+                labels_row = paste(metadata$treatment, 
+                                   metadata$genotype, sep = "-"),
+                labels_col = metadata$sample_id
+                )
+
+ggsave2(filename = "heat_map_intergenc.pdf", plot = hm.p, path = plot_path)
+
+print(hm.p)
+```
+
+**Figure 2:** wt samples cluster by treatment.
+
+### PCA
+
+```{r}
+# PCA
+principal_components <- c(1,2)
+pca.p <- plot_PCA(object = dds.vst, 
+                    ntop = 500,
+                    color_by = "treat_geno", 
+                    shape_by = "experiment",
+                    pcs = principal_components,
+                    returnData = FALSE)
+
+ggsave(paste("pca_by_group_PC",principal_components[1],principal_components[2],"_intergenic.pdf"), plot = pca.p, path = plot_path)
+print(pca.p)
+```
+
+**Figure 3:** Samples group mainly by alpha factor treatment (PC1), but is seems there is a batch effect based on experiment number (PC2).
+
+```{r}
+count_data <- read_counts[,3]
+count_data_no_zeros <- as.data.frame(count_data[count_data>0])
+
+ggplot(count_data_no_zeros, aes(x = log2(count_data_no_zeros[,1]))) +
+  geom_histogram(binwidth = 0.5, fill = "Royalblue", boundary = 0) # +   xlim(0,1000)
+
+```
+
+**Figure 4:** Read counts per intergenic region follows a negative binomial distribution.
+
+### Print DESeq2 coefficients
+
+```{r}
+print(resultsNames(dds))
+```
+
+### Differential expression analysis -wt:
+
+**1- The effect of treatment across all wt samples (the main effect)**
+
+*Note: For additional information about different ways of extracting results from a DESeq object see results() function help by typing ?results in the console,*
+
+```{r, warning=FALSE}
+# Create results directory where to store result tables
+coef <- c("treat_geno_alpha_factor_ste12_vs_none_ste12")
+
+# Set coef_id with the DESeq2 coefficient of interest
+coef_id <- "af_vs_none_ste12"
+
+# Get DESeq2 results. Note that when using coefficient names, you have to convert the coef vector to a list by doing list(c(coef))
+DE_results <- results(dds, contrast=list(c(coef)))
+
+
+plotMA(DE_results, ylim = c( -3, 3))
+
+
+```
+
+**Figure 5:** MA plot before shrinkage
+
+```{r}
+# Shrink Log2FC of genes with low expression 
+DE_results <- lfcShrink(dds, 
+                       contrast = list(c(coef)),
+                       type = "ashr", 
+                       res=DE_results )
+
+# Sort table by adjusted p,value (ascending)
+DE_results <- DE_results[order(DE_results$padj),]
+
+plotMA(DE_results, ylim = c( -3, 3))
+
+# Add gene names to results table
+#DE_results$gene_names <- get_gene_names_from_gene_ids(ensemble_ids = rownames(DE_results), annotation_db = org.Sc.sgd.db, look_for = "ENSEMBL", fetch = "GENENAME")
+DE_results <- add_flanking_genes(summary_table = as.data.frame(DE_results))
+
+# Store results table into DE_results list
+DE_results_list[[coef_id]] <- DE_results
+
+# Plot top10 diff expressed genes
+plot_expression_topN_genes(DE_results_list[[coef_id]], N=20)
+
+
+
+summary(DE_results, alpha = 0.05)
+```
+
+**Figure 6:** MA plot after shrinkage
+
+```{r}
+ggplot(as(DE_results, "data.frame"), aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0)
+```
+
+**Figure 7:** distribution of pvalues from DE results
+
+### Save tables with results stored in the DE_results_list object
+
+```{r}
+for (example_name in names(DE_results_list)){
+  # Save results table into a file
+  write.table(x = as.data.frame(DE_results_list[[example_name]]), 
+            file = paste0(DE_path,"/DE_",example_name,".txt"),
+            sep = "\t", 
+            col.names = NA)
+}
+```
+
+#### Functional analysis of DE resutls
+
+1.  Functions for finctional analysis
+
+```{r}
+dir.create(path = "./no_multimapper/GO_annotation", showWarnings = F)
+dir.create(path = "./no_multimapper/GO_overrepresentation", showWarnings = F)
+dir.create(path = "./no_multimapper/GO_gsea", showWarnings = F)
+
+geneID_2_geneName <-  function(gene_ids){
+  # Split gene ids string into individual ensembl acc ids
+  gene_list <- stringr::str_split_1(string = gene_ids, pattern = "/")
+  
+  # Get gene names from a list of gene ids
+  if (! identical(gene_list, "")){
+    gene_names <- get_gene_names_from_gene_ids(ensemble_ids = gene_list, 
+                                               annotation_db = org.Sc.sgd.db, 
+                                               look_for = 'ENSEMBL', 
+                                               fetch = "GENENAME", 
+                                               return_all = TRUE)
+    gene_list <- paste0(gene_names, collapse = "/")
+  }
+  
+  # Concatenate gene names
+  return(gene_list)
+}
+
+
+run_go_annotation <- function(gene_list, ontology = "BP", level = 3){
+# Fetch GO gene annotations
+  go.annot <- groupGO(keyType = "ENSEMBL",
+                 gene     = gene_list,
+                 OrgDb    = org.Sc.sgd.db,
+                 ont      = ontology,
+                 level    = level,
+                 readable = FALSE) # org.Sc.sgd.db incompatible with this function (SYMBOL col is names GENENAME)
+  
+  # add gene names to output
+  gene_id_list <-  go.annot@result$geneID
+  go.annot@result$gene_name <- unlist(lapply(gene_id_list, FUN = "geneID_2_geneName"))
+  go.annot@result <- subset(go.annot, go.annot@result$Count > 0)
+  
+  # Order by decreasing gene counts
+  go.annot@result <- go.annot@result[order(go.annot@result$Count, decreasing = TRUE),]
+  
+  return(go.annot)
+  #x <- subset(go.annot@result, Count > 0)
+  #return(x[order(x$Count, decreasing = TRUE),])
+}
+
+run_go_overrepresentation <- function(gene_list, ontology = "BP"){
+# Fetch GO gene annotations
+  go.ora <- enrichGO(keyType = "ENSEMBL",
+                 gene     = gene_list,
+                 OrgDb    = org.Sc.sgd.db,
+                 ont      = ontology,
+                 minGSSize = 10,
+                 maxGSSize = 500,
+                 readable = FALSE) # org.Sc.sgd.db incompatible with this function (SYMBOL col is names GENENAME)
+  
+  # add gene names to output
+  gene_id_list <-  go.ora@result$geneID
+  go.ora@result$gene_name <- unlist(lapply(gene_id_list, FUN = "geneID_2_geneName"))
+  go.ora@result <- subset(go.ora@result, go.ora@result$Count > 0)
+  
+  # Order by decreasing gene counts
+  go.ora@result <- go.ora@result[order(go.ora@result$Count, decreasing = TRUE),]
+  
+  return(go.ora)
+  #x <- subset(go.annot@result, Count > 0)
+  #return(x[order(x$Count, decreasing = TRUE),])
+}
+
+```
+
+2.  GO annotation / overrepresentation analysis for genes with padj \<= 0.05 & abs(Log2FC) \>= 1
+
+```{r message=FALSE, warning=FALSE}
+
+# ------------------- af_vs_none_wt # ------------------- 
+
+af_vs_none_wt.df <- DE_results_list$af_vs_none_wt[order(DE_results_list$af_vs_none_wt$padj),]
+af_vs_none_wt.df.sig <- subset(af_vs_none_wt.df, padj <= 0.05 & abs(log2FoldChange) >= 1)
+
+# GO annotation
+af_vs_none_wt.go_annot <- run_go_annotation(gene_list = c(af_vs_none_wt.df.sig$gene_id_up,
+                                                                  af_vs_none_wt.df.sig$gene_id_down))
+
+# GO Overrepresentation analysis
+af_vs_none_wt.go_ora <- run_go_overrepresentation(gene_list = c(af_vs_none_wt.df.sig$gene_id_up,
+                                                                  af_vs_none_wt.df.sig$gene_id_down))
+
+# ------------------- af_vs_none_kar4 # ------------------- 
+
+af_vs_none_kar4.df <- DE_results_list$af_vs_none_kar4[order(DE_results_list$af_vs_none_kar4$padj),]
+af_vs_none_kar4.df.sig <- subset(af_vs_none_kar4.df, padj <= 0.05& abs(log2FoldChange) >= 1)
+
+# GO annotation
+af_vs_none_kar4.go_annot <- run_go_annotation(gene_list = c(af_vs_none_kar4.df.sig$gene_id_up,
+                                                                  af_vs_none_kar4.df.sig$gene_id_down),level = 5)
+
+# GO Overrepresentation analysis
+af_vs_none_kar4.go_ora <- run_go_overrepresentation(gene_list = c(af_vs_none_kar4.df.sig$gene_id_up,
+                                                                  af_vs_none_kar4.df.sig$gene_id_down))
+
+
+# ------------------- af_vs_none_ste12 # ------------------- 
+
+af_vs_none_ste12.df <- DE_results_list$af_vs_none_ste12[order(DE_results_list$af_vs_none_ste12$padj),]
+af_vs_none_ste12.df.sig <- subset(af_vs_none_ste12.df, padj <= 0.05& abs(log2FoldChange) >= 1)
+
+# GO annotation
+af_vs_none_ste12.go_annot <- run_go_annotation(gene_list = c(af_vs_none_ste12.df.sig$gene_id_up,
+                                                                  af_vs_none_ste12.df.sig$gene_id_down))
+
+# GO Overrepresentation analysis
+af_vs_none_ste12.go_ora <- run_go_overrepresentation(gene_list = c(af_vs_none_ste12.df.sig$gene_id_up,
+                                                                  af_vs_none_ste12.df.sig$gene_id_down))
+
+
+```
+
+########################################################################### 
+
+# Compare results between WT and kar4 / ste12
+
+########################################################################### 
+
+```{r}
+
+dir.create(path = "./no_multimapper/Comparison_DE_GO", showWarnings = FALSE, recursive = TRUE)
+
+# Merge DE_result wt vs kar4 df
+wt_kar4.merged <- merge(x = as.data.frame(DE_results_list[["af_vs_none_wt"]]), y = as.data.frame(DE_results_list[["af_vs_none_kar4"]]), by = 'row.names', all = TRUE)
+
+head(wt_kar4.merged)
+
+# Upregulated in WT and not in kar4
+wt_UP_kar4_NC <- subset(wt_kar4.merged, log2FoldChange.x > 1 & log2FoldChange.y < 0.3 & padj.x < 0.05)
+
+# Upregulated in kar4 and not in WT
+wt_NC_kar4_UP <- subset(wt_kar4.merged, log2FoldChange.y > 1 & log2FoldChange.x < 0.3 & padj.y < 0.05)
+
+# Downregulated in WT and not in kar4
+wt_DN_kar4_NC <- subset(wt_kar4.merged, log2FoldChange.x < -1 & log2FoldChange.y > -0.3 & padj.x < 0.05)
+
+# Upregulated in kar4 and not in WT
+wt_NC_kar4_DN <- subset(wt_kar4.merged, log2FoldChange.y < -1 & log2FoldChange.x > -0.3 & padj.y < 0.05)
+
+
+write.table(x = wt_UP_kar4_NC, file = "./no_multimapper/Comparison_DE_GO/wt_UP_kar4_NC.txt", sep = "\t", col.names = NA)
+write.table(x = wt_NC_kar4_UP, file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_UP.txt", sep = "\t", col.names = NA)
+write.table(x = wt_DN_kar4_NC, file = "./no_multimapper/Comparison_DE_GO/wt_DN_kar4_NC.txt", sep = "\t", col.names = NA)
+write.table(x = wt_NC_kar4_DN, file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.txt", sep = "\t", col.names = NA)
+
+
+# Merge DE_result wt vs ste12 df
+wt_ste12.merged <- merge(x = as.data.frame(DE_results_list[["af_vs_none_wt"]]), y = as.data.frame(DE_results_list[["af_vs_none_ste12"]]), by = 'row.names', all = TRUE)
+
+# Upregulated in WT and not in ste12
+wt_UP_ste12_NC <- subset(wt_ste12.merged, log2FoldChange.x > 1 & log2FoldChange.y < 0.3 & padj.x < 0.05)
+
+# Upregulated in ste12 and not in WT
+wt_NC_ste12_UP <- subset(wt_ste12.merged, log2FoldChange.y > 1 & log2FoldChange.x < 0.3 & padj.y < 0.05)
+
+# Downregulated in WT and not in ste12
+wt_DN_ste12_NC <- subset(wt_ste12.merged, log2FoldChange.x < -1 & log2FoldChange.y > -0.3 & padj.x < 0.05)
+
+# Upregulated in ste12 and not in WT
+wt_NC_ste12_DN <- subset(wt_ste12.merged, log2FoldChange.y < -1 & log2FoldChange.x > -0.3 & padj.y < 0.05)
+
+
+write.table(x = wt_UP_ste12_NC, file = "./no_multimapper/Comparison_DE_GO/wt_UP_ste12_NC.txt", sep = "\t", col.names = NA)
+write.table(x = wt_NC_ste12_UP, file = "./no_multimapper/Comparison_DE_GO/wt_NC_ste12_UP.txt", sep = "\t", col.names = NA)
+write.table(x = wt_DN_ste12_NC, file = "./no_multimapper/Comparison_DE_GO/wt_DN_ste12_NC.txt", sep = "\t", col.names = NA)
+write.table(x = wt_NC_ste12_DN, file = "./no_multimapper/Comparison_DE_GO/wt_NC_ste12_DN.txt", sep = "\t", col.names = NA)
+```
+
+#### Summarize comparative DE data
+
+```{r}
+
+select_columns <-  c("Row.names","baseMean.x","log2FoldChange.x","padj.x","baseMean.y","log2FoldChange.y","padj.y")
+
+wt_UP_kar4_NC.summary <- dplyr::select(wt_UP_kar4_NC, select_columns) 
+wt_UP_kar4_NC.summary$igv <- wt_UP_kar4_NC.summary$Row.names %>% 
+                              stringr::str_remove(pattern = "intergenic_") %>%
+                              stringr::str_replace(pattern = '_',replacement = ':') %>% 
+                              stringr::str_replace(pattern = '_',replacement = '-') 
+
+wt_NC_kar4_UP.summary <- dplyr::select(wt_NC_kar4_UP, select_columns) 
+wt_NC_kar4_UP.summary$igv <- wt_NC_kar4_UP.summary$Row.names %>% 
+                              stringr::str_remove(pattern = "intergenic_") %>%
+                              stringr::str_replace(pattern = '_',replacement = ':') %>% 
+                              stringr::str_replace(pattern = '_',replacement = '-') 
+
+wt_DN_kar4_NC.summary <- dplyr::select(wt_DN_kar4_NC, select_columns) 
+wt_DN_kar4_NC.summary$igv <- wt_DN_kar4_NC.summary$Row.names %>% 
+                              stringr::str_remove(pattern = "intergenic_") %>%
+                              stringr::str_replace(pattern = '_',replacement = ':') %>% 
+                              stringr::str_replace(pattern = '_',replacement = '-') 
+
+wt_NC_kar4_DN.summary <- dplyr::select(wt_NC_kar4_DN, select_columns) 
+wt_NC_kar4_DN.summary$igv <- wt_NC_kar4_DN.summary$Row.names %>% 
+                              stringr::str_remove(pattern = "intergenic_") %>%
+                              stringr::str_replace(pattern = '_',replacement = ':') %>% 
+                              stringr::str_replace(pattern = '_',replacement = '-') 
+
+dim(wt_UP_kar4_NC.summary)
+dim(wt_NC_kar4_UP.summary)
+dim(wt_DN_kar4_NC.summary)
+dim(wt_NC_kar4_DN.summary)
+```
+
+#### Prepare gene lists for enrichment analysis
+
+```{r message=FALSE, warning=FALSE}
+
+
+wt_UP_kar4_NC.summary <-add_flanking_genes(summary_table = wt_UP_kar4_NC.summary)
+wt_NC_kar4_UP.summary <-add_flanking_genes(summary_table = wt_NC_kar4_UP.summary)
+wt_DN_kar4_NC.summary <-add_flanking_genes(summary_table = wt_DN_kar4_NC.summary)
+wt_NC_kar4_DN.summary <-add_flanking_genes(summary_table = wt_NC_kar4_DN.summary)
+
+write.table(x = wt_UP_kar4_NC.summary, file = "./no_multimapper/Comparison_DE_GO/wt_UP_kar4_NC.summary.txt", sep = "\t", col.names = NA)
+write.table(x = wt_NC_kar4_UP.summary, file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_UP.summary.txt", sep = "\t", col.names = NA)
+write.table(x = wt_DN_kar4_NC.summary, file = "./no_multimapper/Comparison_DE_GO/wt_DN_kar4_NC.summary.txt", sep = "\t", col.names = NA)
+write.table(x = wt_NC_kar4_DN.summary, file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.txt", sep = "\t", col.names = NA)
+```
+
+#### Functional analysis of flanking genes
+
+```{r message=FALSE, warning=FALSE}
+
+# ------------------------------- wt vs kar4 -------------------------------
+# GO annotation
+wt_UP_kar4_NC.summary.go_annot <- run_go_annotation(gene_list = c(wt_UP_kar4_NC.summary$gene_id_up, 
+                                                                  wt_UP_kar4_NC.summary$gene_id_down))
+write.table(x = as.data.frame(wt_UP_kar4_NC.summary.go_annot), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_UP_kar4_NC.summary.go_annot.txt", sep = "\t", col.names = NA)
+
+wt_NC_kar4_UP.summary.go_annot <- run_go_annotation(gene_list = c(wt_NC_kar4_UP.summary$gene_id_up,
+                                                                  wt_NC_kar4_UP.summary$gene_id_down))
+write.table(x = as.data.frame(wt_NC_kar4_UP.summary.go_annot), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_UP.summary.go_annot.txt", sep = "\t", col.names = NA)
+
+
+wt_DN_kar4_NC.summary.go_annot <- run_go_annotation(gene_list = c(wt_DN_kar4_NC.summary$gene_id_up,
+                                                                  wt_DN_kar4_NC.summary$gene_id_down))
+write.table(x = as.data.frame(wt_DN_kar4_NC.summary.go_annot), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_DN_kar4_NC.summary.go_annot.txt", sep = "\t", col.names = NA)
+
+wt_NC_kar4_DN.summary.go_annot <- run_go_annotation(gene_list = c(wt_NC_kar4_DN.summary$gene_id_up,
+                                                                  wt_NC_kar4_DN.summary$gene_id_down))
+write.table(x = as.data.frame(wt_NC_kar4_DN.summary.go_annot), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.go_annot.txt", sep = "\t", col.names = NA)
+
+# Go Overrepresentation analysis
+wt_UP_kar4_NC.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_UP_kar4_NC.summary$gene_id_up,
+                                                                  wt_UP_kar4_NC.summary$gene_id_down))
+write.table(x = as.data.frame(wt_UP_kar4_NC.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_UP_kar4_NC.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_NC_kar4_UP.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_NC_kar4_UP.summary$gene_id_up,
+                                                                  wt_NC_kar4_UP.summary$gene_id_down))
+write.table(x = as.data.frame(wt_NC_kar4_UP.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_UP.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_DN_kar4_NC.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_DN_kar4_NC.summary$gene_id_up,
+                                                                  wt_DN_kar4_NC.summary$gene_id_down))
+write.table(x = as.data.frame(wt_DN_kar4_NC.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_DN_kar4_NC.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_NC_kar4_DN.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_NC_kar4_DN.summary$gene_id_up,
+                                                                  wt_NC_kar4_DN.summary$gene_id_down))
+write.table(x = as.data.frame(wt_NC_kar4_DN.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+# ------------------------------- wt vs ste12 -------------------------------
+
+# GO annotation
+wt_UP_ste12_NC.summary.go_annot <- run_go_annotation(gene_list = c(wt_UP_ste12_NC$gene_id_up.x,
+                                                                  wt_UP_ste12_NC$gene_id_down.x))
+write.table(x = as.data.frame(wt_NC_kar4_DN.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_NC_ste12_UP.summary.go_annot <- run_go_annotation(gene_list = c(wt_NC_ste12_UP$gene_id_up.x,
+                                                                  wt_NC_ste12_UP$gene_id_down.x))
+write.table(x = as.data.frame(wt_NC_kar4_DN.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_DN_ste12_NC.summary.go_annot <- run_go_annotation(gene_list = c(wt_DN_ste12_NC$gene_id_up.x,
+                                                                  wt_DN_ste12_NC$gene_id_down.x))
+write.table(x = as.data.frame(wt_NC_kar4_DN.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_NC_ste12_DN.summary.go_annot <- run_go_annotation(gene_list = c(wt_NC_ste12_DN$gene_id_up.x,
+                                                                  wt_NC_ste12_DN$gene_id_down.x))
+write.table(x = as.data.frame(wt_NC_kar4_DN.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_kar4_DN.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+# Go Overrepresentation analysis
+wt_UP_ste12_NC.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_UP_ste12_NC$gene_id_up.x,
+                                                                  wt_UP_ste12_NC$gene_id_down.x))
+write.table(x = as.data.frame(wt_UP_ste12_NC.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_UP_ste12_NC.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_NC_ste12_UP.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_UP_ste12_NC$gene_id_up.x,
+                                                                  wt_UP_ste12_NC$gene_id_down.x))
+write.table(x = as.data.frame(wt_NC_ste12_UP.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_ste12_UP.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_DN_ste12_NC.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_UP_ste12_NC$gene_id_up.x,
+                                                                  wt_UP_ste12_NC$gene_id_down.x))
+write.table(x = as.data.frame(wt_DN_ste12_NC.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GOwt_DN_ste12_NC.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+wt_NC_ste12_DN.summary.go_ora <- run_go_overrepresentation(gene_list = c(wt_UP_ste12_NC$gene_id_up.x,
+                                                                  wt_UP_ste12_NC$gene_id_down.x))
+write.table(x = as.data.frame(wt_NC_ste12_DN.summary.go_ora), 
+            file = "./no_multimapper/Comparison_DE_GO/wt_NC_ste12_DN.summary.go_ora.txt", sep = "\t", col.names = NA)
+
+```
+
+#### Comparative Venn diagrams
+
+```{r}
+# Helper function to display Venn diagram
+display_venn <- function(x, ...){
+  grid.newpage()
+  venn_object <- venn.diagram(x, ...)
+  #grid.draw(venn_object)
+  return(venn_object)
+}
+
+# Upregulated genes
+de.wt <- DE_results_list$af_vs_none_wt
+de.kar4 <- DE_results_list$af_vs_none_kar4
+de.ste12 <- DE_results_list$af_vs_none_ste12
+
+# Genes upregulated
+comp.up <- list(
+  WT = rownames(subset(de.wt, log2FoldChange >= 1 & padj <= 0.05)), 
+  Kar4 = rownames(subset(de.kar4, log2FoldChange >= 1 & padj <= 0.05)), 
+  Ste12 = rownames(subset(de.ste12, log2FoldChange >= 1 & padj <= 0.05))
+  )
+
+p.venn.up <- ggvenn(
+  comp.up, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+  stroke_size = 0.5, set_name_size = 4
+) + labs(title = "Upregulated predicted intergenic transcripts (AF vs None)")
+ggsave2(filename = "./no_multimapper/Comparison_DE_GO/comp_venn_up.pdf", plot = p.venn.up)
+
+# Genes downregulated
+comp.down <- list(
+  WT = rownames(subset(de.wt, log2FoldChange <= -1 & padj <= 0.05)), 
+  Kar4 = rownames(subset(de.kar4, log2FoldChange <= -1 & padj <= 0.05)), 
+  Ste12 = rownames(subset(de.ste12, log2FoldChange <= -1 & padj <= 0.05))
+  )
+
+p.venn.down <- ggvenn(
+  comp.down, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+  stroke_size = 0.5, set_name_size = 4
+) + labs(title = "Downregulated predicted intergenic transcripts (AF vs None)")
+ggsave2(filename = "./no_multimapper/Comparison_DE_GO/comp_venn_down.pdf", plot = p.venn.down)
+
+
+comp.table <- as.data.frame(cbind(subset(as.data.frame(summary(comp.up)), Var2 == "Length")[c(1,3)], subset(as.data.frame(summary(comp.down)), Var2 == "Length")[c(3)])
+  )
+colnames(comp.table) <- c("genotype","upregulated","downregulated")
+
+p.venn.up
+p.venn.down
+```
+
+#### Try GO slim approach
+
+```{r}
+library(GSEABase)
+
+
+```
+
+### TPM expression profiles of intergenic regions and its comparison with a similar profile from the protein-coding genes.
+
+```{r}
+intergenic_transcripts.length <- read_counts.star["Length"]
+read_counts.all
+
+# Load read count table from comp8901vs8345
+read_counts.genes <- read.table(file = "./data/read_counts_table_comp8901vs8345.txt",  
+                          header = TRUE, # First line contains column headers 
+                          row.names = 1, # Column 1 contains row names
+                          sep = "\t")   # Column delimiter is a tab (\t)
+
+# Round read counts to the closest integer
+read_counts.genes <- round(read_counts.genes, digits = 0)
+
+
+# Load annotation data
+gene_length <- read.table(file = "./data/gene_length.txt", header = F, row.names = 1)
+colnames(gene_length) <- "Length"
+
+#########################################################################################
+# Calculate TPMs on genes and ITs toether
+#########################################################################################
+read_counts.merged <- rbind(read_counts.all, read_counts.genes)
+feature.length <- rbind(intergenic_transcripts.length, gene_length)
+
+read_counts.merged.tpm <- normalize_by_TPM(
+                          counts.df = read_counts.merged, 
+                          gene_length = feature.length)
+
+data <- as.data.frame(rbind(
+    cbind(
+      TPMs=rowMedians(
+        subset(read_counts.merged.tpm, rownames(read_counts.merged.tpm) %in% rownames(intergenic_transcripts.length))),
+      annot="intergenic_transcripts",
+      gene_id=rownames(subset(read_counts.merged.tpm, rownames(read_counts.merged.tpm) %in%
+                       rownames(intergenic_transcripts.length)))
+      ),
+    cbind(TPMs=rowMedians(
+        subset(read_counts.merged.tpm, rownames(read_counts.merged.tpm) %in% rownames(gene_length))),
+      annot="genes",
+      gene_id=rownames(subset(read_counts.merged.tpm, rownames(read_counts.merged.tpm) %in% rownames(gene_length)))
+      )
+    )
+  )
+
+data$TPMs <- as.numeric(data$TPMs)
+
+data$sig <- 'protein_coding'
+data$sig[which(data$gene_id %in% rownames(intergenic_transcripts.length))] <- 'NOT_DE_interg_transcript'
+
+
+data$sig[which(data$gene_id %in% c(rownames(af_vs_none_wt.df.sig), 
+                                      rownames(af_vs_none_kar4.df.sig), 
+                                      rownames(af_vs_none_ste12.df.sig)))] <- 'DE_interg_transcript'
+
+data$sig <- as.factor(data$sig)
+data$sig <- factor(data$sig, levels = c('protein_coding',"NOT_DE_interg_transcript","DE_interg_transcript"))
+
+hist.p <- ggplot(data, aes(x = TPMs, fill = sig)) +
+  geom_histogram(position = "identity", alpha = 1, bins = 100 ) +
+  labs( title = stringr::str_wrap("Median expression of predicted intergenic transcripts and annotated protein-coding genes", 80)) +
+  theme_classic() + scale_x_log10() + xlab("Log10(median(TPMs))") + scale_fill_manual(values=c("#581845",'#999999','#FFC300'))
+
+
+ggsave2(filename = "intergenic_vs_genes.histogram.pdf", plot = hist.p, path = "./no_multimapper/Plots_intergenic_wt/")
+
+hist.p
+
+
+#########################################################################################
+
+```
+
+### Plot intergenic transcripts dispersion across chromsomes
+
+```{r}
+library(karyoploteR)
+
+pdf(file = "./no_multimapper/Plots_intergenic_wt/IT_distribution_on_chromosomes.pdf")
+
+  # Load Sc genome
+  kp <- karyoploteR::plotKaryotype(genome = "sacCer3")
+  
+  # Add chromosome coords
+  kpAddBaseNumbers(kp, tick.dist = 100000, units  = "kb", tick.len = 10, tick.col="red3", cex=0.5,
+                   minor.tick.dist = 10000, minor.tick.len = 5, minor.tick.col = "gray2")
+  
+  
+  
+  library(rtracklayer)
+  
+  # Load intergenic transcripts as genes
+  features <- import(con = "./data/aymerge.no_LTR.NO_ref_genes_karyoploteR.gtf")
+  genes <- features[features$type=="transcript"]
+  kpPlotRegions(kp, data=genes, col = "green4")
+  
+  # Load centromere coordinates
+  features <- import(con = "./data/centromeres.gff")
+  centromeres <- features[features$type=="centromere"]
+  kpPlotRegions(kp, data=centromeres, col = "red", num.layers = 2)
+  
+dev.off()
+```
+
+### Plot number of DE predicted ITs for each genotype
+
+```{r}
+# Load IDs or ITs supported by CPs (+/- 100bp)
+ITs_supp_by_cp <- read.table(file = "./aymerge.no_LTR.NO_ref_genes_with_PROMOTERS_100bp_window.txt", header = F)
+
+WT <- af_vs_none_wt.df.sig
+WT$CP <- 'Not_supported'
+WT$CP[which(row.names(WT) %in% ITs_supp_by_cp$V1)] <- 'CP_supported'
+
+KAR4 <- af_vs_none_kar4.df.sig
+KAR4$CP <- 'Not_supported'
+KAR4$CP[which(row.names(KAR4) %in% ITs_supp_by_cp$V1)] <- 'CP_supported'
+
+STE12 <- af_vs_none_ste12.df.sig
+STE12$CP <- 'Not_supported'
+STE12$CP[which(row.names(STE12) %in% ITs_supp_by_cp$V1)] <- 'CP_supported'
+
+sig.data <- as.data.frame(cbind(genotype = "WT", CP_support = WT$CP))
+sig.data <- rbind(sig.data, as.data.frame(cbind(genotype = "Kar4", CP_support = KAR4$CP)))
+sig.data <- rbind(sig.data, as.data.frame(cbind(genotype = "Ste12", CP_support = STE12$CP)))
+sig.data$genotype <- as.factor(sig.data$genotype)
+
+# Sort levels so they are being shown in the correct order
+sig.data$genotype <- factor(sig.data$genotype, levels = c("WT","Kar4","Ste12"))
+
+# Plot bar plot
+bar.p <- ggplot(sig.data, aes(genotype)) +
+                geom_bar(aes(fill=CP_support)) +
+                theme_classic() + scale_fill_manual(values=c('#E69F00','#999999'))
+
+ggsave2(filename = "./no_multimapper/Plots_intergenic_wt/sig.genes.pdf", plot = bar.p, width = 4, height = 4)
+bar.p
+```
