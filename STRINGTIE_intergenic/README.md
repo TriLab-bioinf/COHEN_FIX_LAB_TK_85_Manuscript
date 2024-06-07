@@ -9,6 +9,7 @@ RunStringtie.sh
 ```
 
 **Dependencies:**
+
 bedtools v2.31.1
 igvtools v2.17.3
 stringtie v2.2.1
