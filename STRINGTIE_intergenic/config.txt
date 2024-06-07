@@ -1,0 +1,20 @@
+# Path to bam files
+BAM=./bam_files
+
+# Path to reference genome
+REFERENCE=./data/Saccharomyces_cerevisiae.R64-1-1.106.fa
+
+# Path to YeasTSS promoter clusters file
+TSS=./data/ScerYPDconsensusClusters.gff
+
+# Path to annotation file
+ANNOTATION=./data/saccharomyces_cerevisiae_R64-4-1_20230830.gff
+
+# Annotation in gtf format
+ANNOT_GTF=./data/Saccharomyces_cerevisiae.R64-1-1.106.gtf 
+
+# Path to annotated UTRs
+UTR=./data/Nagalakshmi_2008_5_3_UTRs_V64.bed
+
+# chromo sizes
+CHR_SIZE=./data/chromosome_sizes.txt
